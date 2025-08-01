@@ -50,6 +50,201 @@ def register_client(client_data: ClientRequest):
         "client_id": str(result.inserted_id)
     }
 
+# ---- Task Submission API ----
+@app.post("/submit-task/")
+def submit_task(task: TaskRequest):
+    task_data = {
+        "client_name": task.client_name,
+        "category": task.category,
+        "url": task.url,
+        "status": "pending",
+        "created_at": datetime.now()
+    }
+    result = task_col.insert_one(task_data)
+    task_id = str(result.inserted_id)
+
+    try:
+        scrape_and_store(task.url, task.category, task.client_name, task_id)
+        task_col.update_one({"_id": result.inserted_id}, {"$set": {"status": "completed"}})
+    except Exception as e:
+        task_col.update_one({"_id": result.inserted_id}, {"$set": {"status": "failed", "error": str(e)}})
+        return JSONResponse(status_code=500, content={"message": "Scraping failed", "error": str(e)})
+
+    return {"message": "✅ Task created and scraping completed", "task_id": task_id}
+
+@celery_app.task(name="task.scrape_task")
+def scrape_and_store(product_url, category, client_name, task_id):
+    options = uc.ChromeOptions()
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--lang=en-US,en")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+    )
+
+    driver = uc.Chrome(options=options, headless=True)
+    driver.get(product_url)
+    time.sleep(3)
+
+    if "captcha" in driver.page_source.lower():
+        print("CAPTCHA detected! Solve it manually.")
+        input("Press ENTER after solving CAPTCHA...")
+
+    def scroll_to_element(selector, timeout=10):
+        try:
+            elem = WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+            )
+            driver.execute_script("arguments[0].scrollIntoView({behavior:'smooth', block:'center'});", elem)
+            time.sleep(2)
+            return elem
+        except Exception:
+            return None
+
+    def scroll_to_element_by_id(element_id):
+        try:
+            driver.execute_script(f"document.getElementById('{element_id}').scrollIntoView();")
+            time.sleep(2)
+            return True
+        except Exception:
+            return False
+
+    def safe_find_text_by_css(selectors, timeout=5):
+        if isinstance(selectors, str):
+            selectors = [selectors]
+        for selector in selectors:
+            try:
+                elem = WebDriverWait(driver, timeout).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                )
+                text = elem.text.strip()
+                if text:
+                    return text
+            except:
+                continue
+        return "N/A"
+
+    def extract_colors(driver):
+        color_names = set()
+        try:
+            selectors = [
+                'ul[data-tl-id*="color"] button span',
+                'ul[data-tl-id*="color"] label span',
+                'div[data-automation-id="color-picker"] label span',
+                '[data-tl-id*="color"] button span',
+                '[data-tl-id*="color"] label span',
+                '[aria-label*="Color"]',
+                'button[aria-checked="true"] span',
+                '[itemprop="color"]',
+            ]
+
+            for sel in selectors:
+                elems = driver.find_elements(By.CSS_SELECTOR, sel)
+                for elem in elems:
+                    name = elem.text.strip()
+                    if name:
+                        color_names.add(name)
+                if color_names:
+                    break
+
+            if not color_names:
+                imgs = driver.find_elements(By.CSS_SELECTOR,
+                                            'img[data-testid*="swatch"], img[alt*="color"], img[alt*="Color"], img[alt*="colour"]')
+                for img in imgs:
+                    alt = img.get_attribute('alt') or img.get_attribute('title')
+                    if alt:
+                        alt_clean = alt.replace('Color', '').replace('Swatch', '').strip()
+                        if alt_clean:
+                            color_names.add(alt_clean)
+
+            if not color_names:
+                color_names.add("N/A")
+        except Exception:
+            return ["N/A"]
+
+        return list(color_names)
+
+    def extract_sizes(driver):
+        size_names = set()
+        try:
+            size_selectors = [
+                'ul[data-tl-id*="size"] button span',
+                'ul[data-tl-id*="size"] label span',
+                'div[data-automation-id="size-picker"] label',
+                'ul[data-tl-id*="variant"] button span',
+                'ul[data-tl-id*="variant"] label span',
+                '[aria-label*="Size"]',
+                'button[aria-checked="true"] span',
+            ]
+
+            for sel in size_selectors:
+                elems = driver.find_elements(By.CSS_SELECTOR, sel)
+                for elem in elems:
+                    txt = elem.text.strip()
+                    if txt and txt.lower() != "select":
+                        size_names.add(txt)
+                if size_names:
+                    break
+
+            if not size_names:
+                selected = driver.find_elements(By.CSS_SELECTOR, '[aria-checked="true"] span')
+                for s in selected:
+                    txt = s.text.strip()
+                    if txt:
+                        size_names.add(txt)
+
+            if not size_names:
+                return ["N/A"]
+
+            cleaned_sizes = []
+            for size in size_names:
+                try:
+                    size_int = int(size)
+                    cleaned_sizes.append(size_int)
+                except:
+                    cleaned_sizes.append(size)
+            return cleaned_sizes
+        except Exception:
+            return ["N/A"]
+
+    def extract_price(driver):
+        possible_selectors = [
+            'span[itemprop="price"]',
+            'span[data-automation-id="product-price"]',
+            'span.price-characteristic',
+            'span[class*="Price"]',
+            'div[class*="price"] span',
+            'div[data-testid="price"] span'
+        ]
+
+        for sel in possible_selectors:
+            try:
+                elem = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
+                )
+                text = elem.text.strip()
+                if text:
+                    price = text.replace('$', '').replace(',', '').strip()
+                    return float(price)
+            except Exception:
+                continue
+        return 0.0
+
+    # ---- Data Dictionary ----
+    product = {
+        "title": safe_find_text_by_css(['h1.prod-ProductTitle', 'h1[itemprop="name"]'], timeout=15),
+        "price": extract_price(driver),
+        "images": [],
+        "about_this_item": "N/A",
+        "colors": [],  # will be filled below
+        "sizes": [],  # will be filled below
+        "product_url": product_url,
+        "related_links": [],
+    }
 
     product["colors"] = extract_colors(driver)
     product["sizes"] = extract_sizes(driver)
